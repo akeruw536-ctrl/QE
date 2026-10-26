@@ -19,7 +19,7 @@ Deploys exactly like ER: Dockerfile + `python run.py` on Railway.
 
 1. **Regime gate** (`USE_REGIME_GATE`): an Ends Between pays when price stays put, while an EMA cross is a trend-start signal. Trades only in range-like regimes (`RANGE_REGIMES`).
 2. **Monte Carlo + calibration + live proposal + edge gate** (`USE_EDGE_GATE`, `MIN_EDGE`, `MIN_EV`): prices the probability of finishing inside the barriers, compares it with what Deriv charges, and learns from settled trades.
-3. **Barrier width search** (`BARRIER_SCALES`): prices a few widths around the XML barriers live and takes the best EV. `1.0` = XML only.
+3. **Adaptive barriers** (`BARRIER_SCALES`, `BARRIER_SELECTION`): on every signal, 9 widths (0.6x to 2.0x the XML width) are quoted live in parallel; every one that passes the gates is a candidate and the best is bought. `BARRIER_SELECTION=edge` (default) picks the highest edge, `ev` the highest expected profit per stake. `BARRIER_SCALES=1.0` = XML barriers only.
 4. **Volatility-scaled barriers** (`BARRIER_MODE=auto|vol|fixed`): the XML's 41 points only make sense for 1HZ90V (it is ~1 sigma of a 2-minute move there). Other symbols get `BARRIER_VOL_MULTIPLE x sigma x sqrt(minutes)`.
 5. **Safety rails**: `STAKING_MAXIMUM_STAKE` (the XML had none), session halt that lasts until 00:00 UTC instead of stopping forever, DB retry/fallback, restart-safe ladder.
 

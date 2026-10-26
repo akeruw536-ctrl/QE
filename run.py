@@ -42,6 +42,8 @@ SESSION_CACHE_SECONDS = 3.0
 SHADOW_RESOLVE_INTERVAL_SECONDS = 10
 SHADOW_RESOLVE_GRACE_SECONDS = 3      # let the expiry tick land before asking for it
 STATS_LOG_INTERVAL_SECONDS = 15 * 60
+LIVE_WATCHDOG_INTERVAL_SECONDS = 20
+LIVE_WATCHDOG_GRACE_SECONDS = 20     # let the stream settle it first
 HEALTH_STALE_AFTER_SECONDS = 120
 
 
@@ -122,6 +124,7 @@ class Bot:
         await self._restore_open_positions()
 
         self._spawn(self._shadow_resolver_loop(), "shadow-resolver")
+        self._spawn(self._live_settlement_watchdog(), "live-settlement-watchdog")
         self._spawn(self._stats_loop(), "stats-logger")
 
         self.sm.transition(State.READY)
@@ -368,26 +371,66 @@ class Bot:
         await self._track_contract(row["trade_id"], symbol, row["raw_probability"], contract_id)
 
     # --------------------------------------------------------- settlement
+    def _apply_contract_update(self, trade_id, symbol, raw_probability, poc, key=None) -> bool:
+        """Settles a trade from a proposal_open_contract payload if it is sold.
+        Shared by the live stream callback and the settlement watchdog;
+        _settle is idempotent so a duplicate is harmless."""
+        if not poc or not poc.get("is_sold"):
+            return False
+        profit = float(poc.get("profit", 0.0) or 0.0)
+        status = str(poc.get("status") or "").lower()
+        won = status == "won" if status in ("won", "lost") else profit > 0
+        self._settle(trade_id, symbol, raw_probability, won, profit,
+                     exit_spot=_float_or_none(poc.get("exit_tick") or poc.get("exit_spot")),
+                     source="live")
+        if key:
+            self._spawn(self.client.forget_subscription(key), f"forget-{key}")
+        return True
+
     async def _track_contract(self, trade_id: str, symbol: str, raw_probability, contract_id: str):
         key = f"contract:{contract_id}"
 
         def _on_update(msg):
-            poc = msg.get("proposal_open_contract") or {}
-            if not poc.get("is_sold"):
-                return
-            profit = float(poc.get("profit", 0.0) or 0.0)
-            status = str(poc.get("status") or "").lower()
-            won = status == "won" if status in ("won", "lost") else profit > 0
-            self._settle(trade_id, symbol, raw_probability, won, profit,
-                         exit_spot=_float_or_none(poc.get("exit_tick") or poc.get("exit_spot")),
-                         source="live")
-            self._spawn(self.client.forget_subscription(key), f"forget-{contract_id}")
+            self._apply_contract_update(trade_id, symbol, raw_probability,
+                                        msg.get("proposal_open_contract") or {}, key)
 
         try:
             await self.client.subscribe_contract(contract_id, _on_update)
         except Exception as exc:  # noqa: BLE001
             self.logger.error(f"{symbol}: contract subscription failed for {contract_id} (non-fatal, "
-                              f"will retry on next restart): {exc!r}")
+                              f"the settlement watchdog will pick it up): {exc!r}")
+
+    async def _live_settlement_watchdog(self):
+        """Safety net for live trades whose settlement never arrived on the
+        stream (e.g. the socket dropped at the moment of expiry). Any live
+        trade past expiry is queried once per pass and settled if sold.
+        Without this a missed settlement leaves the position slot occupied
+        forever and the bot stops trading."""
+        warned: dict[str, float] = {}
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=LIVE_WATCHDOG_INTERVAL_SECONDS)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                now = time.time()
+                for t in self.storage.open_trades(shadow=False):
+                    cid, exp = t.get("contract_id"), t.get("expires_at")
+                    if not cid or not exp or now < float(exp) + LIVE_WATCHDOG_GRACE_SECONDS:
+                        continue
+                    try:
+                        poc = await self.client.get_contract(cid)
+                    except Exception as exc:  # noqa: BLE001
+                        if now - warned.get(cid, 0) > 300:
+                            warned[cid] = now
+                            self.logger.warning(f"watchdog: could not query contract {cid}: {exc!r}")
+                        continue
+                    if self._apply_contract_update(t["trade_id"], t["symbol"], t.get("raw_probability"),
+                                                   poc, f"contract:{cid}"):
+                        self.logger.warning(f"{t['symbol']} watchdog settled contract {cid} that the stream missed")
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning(f"settlement watchdog pass failed (non-fatal): {exc!r}")
 
     def _settle(self, trade_id, symbol, raw_probability, won: bool, profit: float, *, exit_spot=None, source=""):
         """Single settlement path for live and shadow. The DB update is
@@ -475,6 +518,12 @@ class Bot:
             "state": self.sm.state.value,
             "uptime_seconds": int(time.time() - self.started_at),
             "open_positions": self._open_count(),
+            "deriv": {
+                "reconnects": getattr(self.client, "reconnect_count", None),
+                "keepalive_pings": getattr(self.client, "ping_count", None),
+                "last_ping_age_seconds": (round(time.time() - self.client.last_ping_ok, 1)
+                                          if getattr(self.client, "last_ping_ok", 0) else None),
+            },
             "active_cautions": {k: c.reason for k, c in self.sm.active_cautions().items()},
             "session": {"status": status, "day_pnl": round(pnl, 2),
                         "target_profit": self.cfg.target_profit, "stop_loss": self.cfg.stop_loss},

@@ -204,3 +204,37 @@ def test_tick_callback_only_spawns_on_a_confirmed_cross(bot):
         bot._on_tick("1HZ90V", {"tick": {"quote": 89.0}})                    # no new cross
         return spawned
     assert asyncio.run(go()) == ["signal-1HZ90V"]
+
+
+# --------------------------------------------------- adaptive barrier selection
+class WidthPricedClient(FakeClient):
+    """Deriv-like pricing: the wider the barrier, the lower the payout."""
+    async def request_proposal(self, symbol, duration_minutes, stake, lower_barrier, upper_barrier, currency="USD"):
+        width = upper_barrier - lower_barrier
+        mult = max(1.02, 2.4 - width / 40.0)
+        self.proposals.append((symbol, duration_minutes, stake, lower_barrier, upper_barrier))
+        return {"id": f"P{len(self.proposals)}", "payout": round(stake * mult, 2), "spot": self.price}
+
+
+@pytest.mark.parametrize("selection", ["edge", "ev"])
+def test_best_candidate_is_chosen_by_the_configured_criterion(monkeypatch, selection):
+    import app.strategy.engine as eng
+    seen = []
+    real = eng.evaluate
+    monkeypatch.setattr(eng, "evaluate", lambda **kw: seen.append(real(**kw)) or seen[-1])
+
+    cfg = _cfg(use_regime_gate=False, min_edge=-1.0, min_ev=-1.0, barrier_selection=selection)
+    cfg.staking.maximum_stake = 1000.0
+    client = WidthPricedClient()
+    out = _run(cfg, client, _closes())
+
+    assert len(client.proposals) == len(cfg.barrier_scales) == 9      # whole grid quoted
+    accepted = [d for d in seen if d.accept]
+    assert out.traded and len(accepted) >= 2
+    key = (lambda d: d.edge) if selection == "edge" else (lambda d: d.expected_value)
+    chosen = out.trade_row["edge"] if selection == "edge" else out.trade_row["expected_value"]
+    assert chosen == pytest.approx(max(key(d) for d in accepted))
+
+
+def test_invalid_selection_is_reported():
+    assert any("BARRIER_SELECTION" in p for p in _cfg(barrier_selection="best").validate())

@@ -132,7 +132,16 @@ class Config:
     barrier_vol_multiple: float = float(os.getenv("BARRIER_VOL_MULTIPLE", "1.0"))
     # [ADDED] intelligence layer: also price barrier widths scaled around the
     # base (XML) width and take the best live-priced EV. "1.0" = XML only.
-    barrier_scales: List[float] = field(default_factory=lambda: _env_float_list("BARRIER_SCALES", [0.9, 1.0, 1.15, 1.3]))
+    # Widths are multiples of the base (XML / vol) width, so the search is
+    # adaptive: every signal prices all of them live and keeps the best.
+    barrier_scales: List[float] = field(
+        default_factory=lambda: _env_float_list("BARRIER_SCALES", [0.6, 0.75, 0.9, 1.0, 1.15, 1.3, 1.5, 1.75, 2.0])
+    )
+    # What "best" means among the ACCEPTED candidates: "edge" (model probability
+    # minus Deriv's implied probability) or "ev" (edge x payout, i.e. expected
+    # profit per stake). They can disagree: a tight barrier has a big payout
+    # and a small edge, a wide one the reverse.
+    barrier_selection: str = field(default_factory=lambda: os.getenv("BARRIER_SELECTION", "edge").lower())
 
     # --- intelligence gates ([ADDED], each can be switched off) ---
     use_regime_gate: bool = field(default_factory=lambda: _env_bool("USE_REGIME_GATE", True))
@@ -202,6 +211,8 @@ class Config:
             problems.append("CANDLE_REFERENCE must be closed or forming.")
         if self.barrier_mode not in ("auto", "fixed", "vol"):
             problems.append("BARRIER_MODE must be auto, fixed or vol.")
+        if self.barrier_selection not in ("edge", "ev"):
+            problems.append("BARRIER_SELECTION must be edge or ev.")
         if not self.barrier_scales or any(s <= 0 for s in self.barrier_scales):
             problems.append("BARRIER_SCALES must be positive numbers.")
         if self.duration_minutes < 1:

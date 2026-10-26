@@ -7,7 +7,7 @@ Decision pipeline, run only when the entry signal fires:
       -> Monte Carlo + calibration [ADDED]  P(exit inside barriers)
       -> live Deriv proposal             never trade on theoretical payout
       -> edge / EV / uncertainty gate [ADDED]
-      -> best accepted candidate (highest EV) is returned for execution
+      -> best accepted candidate (BARRIER_SELECTION: edge or ev) is returned for execution
 
 Each [ADDED] layer can be switched off (USE_REGIME_GATE / USE_EDGE_GATE), and
 with both off the bot is the plain XML strategy: signal -> buy at the XML
@@ -133,19 +133,25 @@ async def evaluate_signal(
     best_decision = None
     best_row = None
 
-    for ch, mc in zip(choices, mcs):
+    # Quote every width at once (the client rate-limits internally): one
+    # round-trip of latency instead of N, and the proposals are all equally
+    # fresh when the winner is bought.
+    valid = [(ch, mc) for ch, mc in zip(choices, mcs)
+             if ch.upper_offset > ch.lower_offset and ch.lower_offset < 0 < ch.upper_offset]
+    quotes = await asyncio.gather(*[
+        client.request_proposal(symbol=symbol, duration_minutes=duration, stake=stake,
+                                lower_barrier=ch.lower_offset, upper_barrier=ch.upper_offset)
+        for ch, _ in valid
+    ], return_exceptions=True)
+
+    def _score(d) -> float:
+        return d.edge if cfg.barrier_selection == "edge" else d.expected_value
+
+    for (ch, mc), proposal in zip(valid, quotes):
         calibrated = calibration.calibrate(mc.probability, buckets=calibration_buckets)
         lower_offset, upper_offset = ch.lower_offset, ch.upper_offset
-        if upper_offset <= lower_offset or lower_offset >= 0 or upper_offset <= 0:
-            continue
-
-        try:
-            proposal = await client.request_proposal(
-                symbol=symbol, duration_minutes=duration, stake=stake,
-                lower_barrier=lower_offset, upper_barrier=upper_offset,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"{symbol}: proposal failed for x{ch.scale:g} ({exc!r}) -- skipping candidate")
+        if isinstance(proposal, Exception):
+            logger.warning(f"{symbol}: proposal failed for x{ch.scale:g} ({proposal!r}) -- skipping candidate")
             continue
 
         payout = float(proposal.get("payout", 0.0) or 0.0)
@@ -198,7 +204,7 @@ async def evaluate_signal(
         )
 
         if decision.accept:
-            if best_decision is None or decision.expected_value > best_decision.expected_value:
+            if best_decision is None or _score(decision) > _score(best_decision):
                 best_decision, best_row = decision, row
         else:
             rejections.append({**row, "rejection_reason": decision.reason})

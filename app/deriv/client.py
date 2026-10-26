@@ -91,6 +91,9 @@ AUTH_OTP = "otp"
 AUTH_LEGACY = "legacy"
 
 
+KEEPALIVE_INTERVAL_SECONDS = 30.0   # Deriv closes a socket with no API request for ~2 min
+
+
 class DerivAPIError(Exception):
     def __init__(self, code: str, message: str, raw: dict | None = None):
         super().__init__(f"{code}: {message}")
@@ -174,6 +177,10 @@ class DerivClient:
 
         self._pump_task: asyncio.Task | None = None
         self._supervisor_task: asyncio.Task | None = None
+        self._keepalive_task: asyncio.Task | None = None
+        self.ping_count = 0
+        self.last_ping_ok: float = 0.0
+        self.reconnect_count = 0
         self._connect_lock = asyncio.Lock()
         self._closed = False
         self.last_message_at: float = 0.0
@@ -188,11 +195,31 @@ class DerivClient:
             self._pump_task = asyncio.create_task(self._recv_pump(), name="deriv-pump")
         # Rule 2: exactly one long-lived supervisor for the client's whole life.
         self._supervisor_task = asyncio.create_task(self._supervise_pump(), name="deriv-pump-supervisor")
+        self._keepalive_task = asyncio.create_task(self._keepalive(), name="deriv-keepalive")
         self.logger.info(f"Deriv connected (auth_mode={self.auth_mode})")
+
+    async def _keepalive(self) -> None:
+        """Deriv drops a socket that carries no API requests for ~2 minutes
+        (WebSocket-level pings don't count). With nothing to scan or settle the
+        bot went quiet and reconnected every ~2 minutes for hours. A tiny
+        application ping every 30s keeps the connection up."""
+        while not self._closed:
+            await asyncio.sleep(KEEPALIVE_INTERVAL_SECONDS)
+            if self._closed:
+                return
+            try:
+                if self._ws is not None and self._ws.state is WsState.OPEN:
+                    await self.send({"ping": 1}, timeout=10.0)
+                    self.ping_count += 1
+                    self.last_ping_ok = time.time()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.logger.debug(f"Deriv keepalive ping failed (non-fatal): {exc!r}")
 
     async def close(self) -> None:
         self._closed = True
-        for t in (self._pump_task, self._supervisor_task):
+        for t in (self._pump_task, self._supervisor_task, self._keepalive_task):
             if t:
                 t.cancel()
         if self._ws is not None:
@@ -425,6 +452,7 @@ class DerivClient:
         async with self._connect_lock:
             if self._ws is not None and self._ws.state is WsState.OPEN:
                 return  # someone else reconnected while this caller waited
+            self.reconnect_count += 1
             await self._open_socket()
             # RULE 3, the whole point: start the reader on the NEW socket
             # before any resubscribe, because resubscribes await responses
@@ -436,6 +464,19 @@ class DerivClient:
                     sub.subscription_id = (resp.get("subscription") or {}).get("id")
                 except Exception as exc:  # noqa: BLE001
                     self.logger.error(f"Deriv: failed to resubscribe {key}: {exc!r}")
+                    continue
+                # A contract that expired while the socket was down comes back as an
+                # already-sold snapshot in this very response -- with no subscription
+                # id, so the router never delivers it. Hand it to the callback here,
+                # otherwise the settlement is lost and the position slot stays
+                # occupied forever (seen in production: one trade stuck for hours).
+                poc = resp.get("proposal_open_contract")
+                if key.startswith("contract:") and poc:
+                    try:
+                        sub.callback({"proposal_open_contract": poc,
+                                      "subscription": {"id": sub.subscription_id}})
+                    except Exception as exc:  # noqa: BLE001
+                        self.logger.error(f"Deriv: contract snapshot callback failed after resubscribe: {exc!r}")
         if self.on_reconnect:
             await self.on_reconnect()
 
@@ -599,6 +640,16 @@ class DerivClient:
             except Exception as exc:  # noqa: BLE001
                 self.logger.error(f"Deriv: initial contract callback failed (non-fatal): {exc!r}")
         return key
+
+    async def get_contract(self, contract_id) -> dict:
+        """One-shot (non-subscribing) state of a contract -- the fallback for
+        settlements the stream missed."""
+        try:
+            wire_id = int(contract_id)
+        except (TypeError, ValueError):
+            wire_id = contract_id
+        resp = await self.send({"proposal_open_contract": 1, "contract_id": wire_id}, timeout=15.0)
+        return resp.get("proposal_open_contract") or {}
 
     async def forget_subscription(self, key: str) -> None:
         """Stops tracking a subscription locally and asks Deriv to end the
