@@ -43,6 +43,9 @@ SHADOW_RESOLVE_INTERVAL_SECONDS = 10
 SHADOW_RESOLVE_GRACE_SECONDS = 3      # let the expiry tick land before asking for it
 STATS_LOG_INTERVAL_SECONDS = 15 * 60
 LIVE_WATCHDOG_INTERVAL_SECONDS = 20
+DATA_RECOVERY_INTERVAL_SECONDS = 20
+TICK_SILENCE_RECONNECT_SECONDS = 90    # no tick on any symbol for this long -> force a reconnect
+FORCED_RECONNECT_COOLDOWN_SECONDS = 120
 LIVE_WATCHDOG_GRACE_SECONDS = 20     # let the stream settle it first
 HEALTH_STALE_AFTER_SECONDS = 120
 
@@ -65,6 +68,8 @@ class Bot:
         self.detectors: dict[str, TickSignalDetector] = {}
         self._evaluating: set[str] = set()
         self._probe_only: dict[str, bool] = {}
+        self._tick_subscribed: set[str] = set()
+        self._last_tick_at: dict[str, float] = {}
         self._session_cache: tuple | None = None   # (fetched_at, pnl)
         self._session_state_logged = "OK"
         # trade_id -> symbol for every position occupying a slot. Shadow
@@ -134,6 +139,7 @@ class Bot:
         self._spawn(self._shadow_resolver_loop(), "shadow-resolver")
         self._spawn(self._live_settlement_watchdog(), "live-settlement-watchdog")
         self._spawn(self._probe_resolver_loop(), "probe-resolver")
+        self._spawn(self._data_recovery_loop(), "data-recovery")
         self._spawn(self._stats_loop(), "stats-logger")
 
         self.sm.transition(State.READY)
@@ -146,19 +152,60 @@ class Bot:
 
     async def _prime_ticks(self):
         """Seed each symbol's EMA state from tick history, then subscribe. A
-        cross is detected on the exact tick it happens, like the XML."""
+        cross is detected on the exact tick it happens, like the XML. Failures
+        here must never kill the process (a dead data feed used to crash-loop
+        the container until Railway gave up): the recovery loop retries."""
         for symbol in self.cfg.symbols:
-            det = TickSignalDetector(self.cfg.ema_fast, self.cfg.ema_slow, self.cfg.require_tick_confirmation)
+            self.detectors.setdefault(
+                symbol, TickSignalDetector(self.cfg.ema_fast, self.cfg.ema_slow, self.cfg.require_tick_confirmation))
+            await self._subscribe_ticks_safe(symbol)
+
+    async def _subscribe_ticks_safe(self, symbol: str) -> bool:
+        det = self.detectors[symbol]
+        if not det.ready:
             try:
                 history = await self.client.get_tick_history(symbol, self.cfg.tick_buffer)
+                if history:
+                    det.seed(history)
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning(f"{symbol}: tick history failed ({exc!r}) -- will warm up from live ticks")
-                history = []
-            if history:
-                det.seed(history)
-            self.detectors[symbol] = det
+        try:
             await self.client.subscribe_ticks(symbol, lambda msg, s=symbol: self._on_tick(s, msg))
-            self.logger.info(f"{symbol}: tick stream subscribed (EMA state {'seeded from %d ticks' % len(history) if det.ready else 'warming up'})")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(f"{symbol}: tick subscription failed ({exc!r}) -- will keep retrying")
+            return False
+        self._tick_subscribed.add(symbol)
+        self._last_tick_at.setdefault(symbol, time.time())
+        self.logger.info(f"{symbol}: tick stream subscribed (EMA state "
+                         f"{'ready' if det.ready else 'warming up from live ticks'})")
+        return True
+
+    async def _data_recovery_loop(self):
+        """Keeps the data feed alive without a restart: retries a failed tick
+        subscription or empty candle history, and if NO symbol has produced a
+        tick for TICK_SILENCE_RECONNECT_SECONDS (a connected-but-silent socket)
+        forces a fresh connection."""
+        last_forced = 0.0
+        while not self._stop.is_set():
+            try:
+                for symbol in self.cfg.symbols:
+                    if symbol not in self._tick_subscribed:
+                        await self._subscribe_ticks_safe(symbol)
+                    if not self.candles_by_symbol.get(symbol):
+                        await self._refresh_candles(symbol)
+                if self._tick_subscribed:
+                    now = time.time()
+                    newest = max(self._last_tick_at.get(s, 0.0) for s in self._tick_subscribed)
+                    if (now - newest > TICK_SILENCE_RECONNECT_SECONDS
+                            and now - last_forced > FORCED_RECONNECT_COOLDOWN_SECONDS):
+                        last_forced = now
+                        await self.client.force_reconnect(f"no ticks for {int(now - newest)}s")
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning(f"data recovery pass failed (non-fatal): {exc!r}")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=DATA_RECOVERY_INTERVAL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
 
     async def _refresh_candles(self, symbol: str) -> None:
         """Fresh fetch of candle history (OHLC). Deliberately NOT built on the
@@ -219,6 +266,7 @@ class Bot:
         det = self.detectors.get(symbol)
         if quote is None or det is None or self._stop.is_set():
             return
+        self._last_tick_at[symbol] = time.time()
         try:
             direction = det.feed(float(quote))
         except (TypeError, ValueError):
