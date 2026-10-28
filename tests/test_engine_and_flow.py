@@ -58,7 +58,6 @@ def _cfg(**kw):
     c = Config()
     c.symbols = ["1HZ90V"]
     c.monte_carlo.default_paths = 4000
-    c.min_win_probability = 0.0          # individual tests opt in
     for k, v in kw.items():
         setattr(c, k, v)
     return c
@@ -139,7 +138,6 @@ def bot(monkeypatch):
     monkeypatch.setenv("USE_REGIME_GATE", "false")
     monkeypatch.setenv("BARRIER_SCALES", "1.0")
     monkeypatch.setenv("MC_PATHS", "3000")
-    monkeypatch.setenv("MIN_WIN_PROBABILITY", "0")
     monkeypatch.setenv("SHADOW_MODE", "true")
     monkeypatch.delenv("DATABASE_URL", raising=False)
     import run
@@ -230,7 +228,7 @@ def test_best_candidate_is_chosen_by_the_configured_criterion(monkeypatch, selec
     client = WidthPricedClient()
     out = _run(cfg, client, _closes())
 
-    assert len(client.proposals) == len(cfg.barrier_scales) == 7      # whole grid quoted
+    assert len(client.proposals) == len(cfg.barrier_scales) == 9      # whole grid quoted
     accepted = [d for d in seen if d.accept]
     assert out.traded and len(accepted) >= 2
     key = (lambda d: d.edge) if selection == "edge" else (lambda d: d.expected_value)
@@ -240,42 +238,3 @@ def test_best_candidate_is_chosen_by_the_configured_criterion(monkeypatch, selec
 
 def test_invalid_selection_is_reported():
     assert any("BARRIER_SELECTION" in p for p in _cfg(barrier_selection="best").validate())
-
-
-# ------------------------------------------------------ minimum win probability
-def test_min_win_probability_forces_wider_barriers():
-    cfg = _cfg(use_edge_gate=False, use_regime_gate=False, min_win_probability=0.80,
-               barrier_scales=[0.5, 1.0, 2.5, 3.5])
-    cfg.staking.maximum_stake = 1000.0
-    client = FakeClient(payout=1.2)
-    out = _run(cfg, client, _closes())
-    assert out.traded
-    assert out.trade_row["calibrated_probability"] >= 0.80
-    chosen_width = out.trade_row["upper_barrier"] - out.trade_row["lower_barrier"]
-    assert chosen_width > 2 * 41.46 * 1.4                      # wider than the XML barriers
-    assert any("WIN PROBABILITY" in r["rejection_reason"] for r in out.rejections)   # tight ones were turned away
-
-
-def test_min_win_probability_can_reject_everything():
-    cfg = _cfg(use_edge_gate=False, use_regime_gate=False, min_win_probability=0.99, barrier_scales=[1.0])
-    out = _run(cfg, FakeClient(), _closes())
-    assert not out.traded
-    assert "WIN PROBABILITY" in out.rejections[0]["rejection_reason"]
-
-
-def test_too_wide_barriers_with_no_return_are_skipped_quietly():
-    class NoReturnClient(FakeClient):
-        async def request_proposal(self, symbol, duration_minutes, stake, lower_barrier, upper_barrier, currency="USD"):
-            if upper_barrier > 60:
-                raise RuntimeError("ContractBuyValidationError: This contract offers no return.")
-            return await super().request_proposal(symbol, duration_minutes, stake, lower_barrier, upper_barrier)
-    cfg = _cfg(use_edge_gate=False, use_regime_gate=False, barrier_scales=[1.0, 2.0])
-    log = _Log()
-    st = _storage()
-    out = asyncio.run(evaluate_signal("1HZ90V", "DOWN", _closes(), 28000.0, NoReturnClient(), CalibrationTracker(st),
-                                      build_staking_engine(cfg.staking), cfg, log))
-    assert out.traded and any("too wide" in l for l in log.lines)
-
-
-def test_min_win_probability_validation():
-    assert any("MIN_WIN_PROBABILITY" in p for p in _cfg(min_win_probability=1.5).validate())

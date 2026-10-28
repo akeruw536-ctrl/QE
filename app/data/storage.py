@@ -18,7 +18,7 @@ import numpy as np
 
 from sqlalchemy import (
     JSON, Column, DateTime, Float, Integer, MetaData, String, Table, create_engine, func as sa_func,
-    delete, inspect, insert, select, text, update
+    inspect, insert, select, text, update
 )
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.sql import func
@@ -63,7 +63,6 @@ trades = Table(
     Column("opened_at", Float),
     Column("expires_at", Float),
     Column("exit_spot", Float),
-    Column("signal_logit_mean", Float),
 )
 
 rejected_signals = Table(
@@ -90,32 +89,6 @@ calibration_buckets = Table(
     Column("n_predictions", Integer, default=0),
     Column("n_wins", Integer, default=0),
     Column("updated_at", DateTime(timezone=True), onupdate=func.now(), server_default=func.now()),
-)
-
-# Outcomes of priced barrier candidates the bot did NOT trade ("probes"). Every
-# signal prices several barrier widths but buys at most one; the rest used to
-# be thrown away. Resolving them against the real expiry tick gives the
-# calibration layer many more labelled outcomes -- including for the barrier
-# widths and regimes it never trades, which removes the selection bias of
-# learning only from its own trades.
-calibration_samples = Table(
-    "calibration_samples", metadata,
-    Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("created_at", DateTime(timezone=True), server_default=func.now()),
-    Column("symbol", String),
-    Column("regime", String),
-    Column("raw_probability", Float),
-    Column("lower_barrier", Float),
-    Column("upper_barrier", Float),
-    Column("opened_at", Float),
-    Column("expires_at", Float),
-    Column("resolved", Integer, default=0),     # 0 open, 1 resolved, 2 gave up
-    Column("won", Integer),
-    Column("exit_spot", Float),
-    # mean logit of the raw probability over ALL candidates priced for the same
-    # signal -- lets calibration separate "how calm is the market" (between
-    # signals) from "how wide is this barrier" (within a signal)
-    Column("signal_logit_mean", Float),
 )
 
 system_events = Table(
@@ -363,190 +336,6 @@ class Storage:
             "total_staked": round(staked, 2), "pnl": round(pnl, 2),
             "roi": round(pnl / staked, 4) if staked else None,
         }
-
-    def ladder_stats(self, shadow: bool, martingale_start: int = 1, martingale_level: int = 5) -> Dict[str, Any]:
-        """Risk side of the journal: highest stake, highest martingale level
-        actually staked, longest losing streak and worst drawdown.
-
-        "Level n" = the stake placed after n straight losses while the ladder
-        was escalating (martingale_start <= n <= martingale_level). Level 0 is
-        the first stake (including the reset after the ladder is exhausted).
-        """
-        with self.engine.begin() as conn:
-            rows = conn.execute(
-                select(trades.c.id, trades.c.trade_id, trades.c.symbol, trades.c.opened_at, trades.c.stake,
-                       trades.c.result, trades.c.profit_loss)
-                .where(trades.c.shadow == (1 if shadow else 0))
-                .order_by(trades.c.id.asc())
-            ).all()
-
-        streak = max_streak = max_level = 0
-        cum = peak = max_dd = 0.0
-        level_counts: Dict[int, int] = {}
-        level_of: Dict[str, int] = {}
-        for r in rows:
-            if r[5] not in ("WIN", "LOSS"):
-                continue
-            n = streak
-            level = n if (martingale_level > 0 and martingale_start > 0
-                          and martingale_start <= n <= martingale_level) else 0
-            level_of[r[1]] = level
-            level_counts[level] = level_counts.get(level, 0) + 1
-            max_level = max(max_level, level)
-            cum += float(r[6] or 0.0)
-            peak = max(peak, cum)
-            max_dd = max(max_dd, peak - cum)
-            if r[5] == "WIN":
-                streak = 0
-            else:
-                streak += 1
-                max_streak = max(max_streak, streak)
-
-        biggest = max((r for r in rows if r[4] is not None), key=lambda r: float(r[4]), default=None)
-        max_stake = None
-        if biggest is not None:
-            max_stake = {
-                "stake": float(biggest[4]), "symbol": biggest[2], "result": biggest[5],
-                "level": level_of.get(biggest[1]),
-                "opened_at_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(biggest[3])) if biggest[3] else None,
-            }
-        return {
-            "max_stake": max_stake,
-            "max_martingale_level": max_level,
-            "max_loss_streak": max_streak,
-            "current_loss_streak": streak,
-            "max_drawdown": round(max_dd, 2),
-            "trades_per_level": {str(k): v for k, v in sorted(level_counts.items())},
-        }
-
-    def breakdown(self, shadow: bool) -> Dict[str, Any]:
-        """Settled trades split by the CLAIMED edge at entry, the regime, the
-        stake size (= martingale rung) and the barrier width. Answers "which
-        trades make the money?" -- in particular whether low-claimed-edge
-        trades are really zero-edge (the model is optimistic by several points)."""
-        with self.engine.begin() as conn:
-            rows = conn.execute(
-                select(trades.c.edge, trades.c.regime, trades.c.stake, trades.c.result,
-                       trades.c.profit_loss, trades.c.upper_barrier, trades.c.lower_barrier,
-                       trades.c.entry_price)
-                .where(trades.c.shadow == (1 if shadow else 0))
-                .where(trades.c.result.in_(["WIN", "LOSS"]))
-            ).all()
-
-        def label(value, cuts, names):
-            if value is None:
-                return "unknown"
-            for cut, name in zip(cuts, names):
-                if value < cut:
-                    return name
-            return names[-1]
-
-        def width_pct(r):
-            try:
-                return 100.0 * (float(r[5]) - float(r[6])) / float(r[7])
-            except (TypeError, ValueError, ZeroDivisionError):
-                return None
-
-        def group(key_fn, order=None):
-            acc: Dict[str, list] = {}
-            for r in rows:
-                acc.setdefault(key_fn(r), []).append(r)
-            out = []
-            for name in (order or sorted(acc)):
-                grp = acc.get(name)
-                if not grp:
-                    continue
-                n = len(grp)
-                wins = sum(1 for r in grp if r[3] == "WIN")
-                staked = sum(float(r[2] or 0) for r in grp)
-                pnl = sum(float(r[4] or 0) for r in grp)
-                out.append({"bucket": name, "n": n, "win_rate": round(wins / n, 3),
-                            "pnl": round(pnl, 2), "roi": round(pnl / staked, 3) if staked else None})
-            return out
-
-        edge_names = ["<0.03", "0.03-0.06", "0.06-0.10", ">=0.10"]
-        stake_names = ["<=1.0", "1.0-3.0", "3.0-10", ">10"]
-        width_names = ["<0.3%", "0.3-0.4%", "0.4-0.5%", ">=0.5%"]
-        return {
-            "by_claimed_edge": group(lambda r: label(r[0], [0.03, 0.06, 0.10, 9e9], edge_names), edge_names + ["unknown"]),
-            "by_regime": group(lambda r: r[1] or "unknown"),
-            "by_stake": group(lambda r: label(r[2], [1.0000001, 3.0, 10.0, 9e9], stake_names), stake_names + ["unknown"]),
-            "by_barrier_width": group(lambda r: label(width_pct(r), [0.3, 0.4, 0.5, 9e9], width_names), width_names + ["unknown"]),
-        }
-
-    # ------------------------------------------------------------- probes
-    def record_probes(self, rows: list) -> int:
-        rows = [r for r in rows if r.get("raw_probability") is not None]
-        if not rows:
-            return 0
-        with self.engine.begin() as conn:
-            conn.execute(insert(calibration_samples), [_plain(r) for r in rows])
-        return len(rows)
-
-    def open_probes(self, due_before: float, limit: int = 500) -> list:
-        with self.engine.begin() as conn:
-            res = conn.execute(
-                select(calibration_samples)
-                .where(calibration_samples.c.resolved == 0)
-                .where(calibration_samples.c.expires_at <= due_before)
-                .order_by(calibration_samples.c.expires_at.asc()).limit(limit)
-            )
-            return [dict(r._mapping) for r in res.all()]
-
-    def resolve_probe(self, probe_id: int, won: bool, exit_spot: float) -> bool:
-        with self.engine.begin() as conn:
-            res = conn.execute(
-                update(calibration_samples)
-                .where(calibration_samples.c.id == probe_id)
-                .where(calibration_samples.c.resolved == 0)
-                .values(resolved=1, won=1 if won else 0, exit_spot=exit_spot)
-            )
-            return res.rowcount > 0
-
-    def abandon_probe(self, probe_id: int) -> None:
-        with self.engine.begin() as conn:
-            conn.execute(update(calibration_samples)
-                         .where(calibration_samples.c.id == probe_id)
-                         .where(calibration_samples.c.resolved == 0).values(resolved=2))
-
-    def prune_probes(self, older_than_epoch: float) -> int:
-        with self.engine.begin() as conn:
-            res = conn.execute(delete(calibration_samples)
-                               .where(calibration_samples.c.resolved > 0)
-                               .where(calibration_samples.c.opened_at < older_than_epoch))
-            return res.rowcount or 0
-
-    def probe_counts(self) -> Dict[str, int]:
-        with self.engine.begin() as conn:
-            rows = conn.execute(select(calibration_samples.c.resolved, sa_func.count())
-                                .group_by(calibration_samples.c.resolved)).all()
-        c = {int(r[0] or 0): int(r[1]) for r in rows}
-        return {"open": c.get(0, 0), "resolved": c.get(1, 0), "abandoned": c.get(2, 0)}
-
-    def calibration_dataset(self, max_rows: int = 20000) -> list:
-        """Everything the calibrator may learn from: settled trades (live and
-        shadow) plus resolved probes. Newest first, capped."""
-        out = []
-        with self.engine.begin() as conn:
-            for r in conn.execute(
-                select(trades.c.raw_probability, trades.c.result, trades.c.regime, trades.c.opened_at,
-                       trades.c.signal_logit_mean)
-                .where(trades.c.result.in_(["WIN", "LOSS"]))
-                .where(trades.c.raw_probability.is_not(None))
-                .order_by(trades.c.id.desc()).limit(max_rows)
-            ).all():
-                out.append({"raw": float(r[0]), "won": 1 if r[1] == "WIN" else 0, "regime": r[2],
-                            "opened_at": r[3], "source": "trade", "signal_mean": r[4]})
-            for r in conn.execute(
-                select(calibration_samples.c.raw_probability, calibration_samples.c.won,
-                       calibration_samples.c.regime, calibration_samples.c.opened_at,
-                       calibration_samples.c.symbol, calibration_samples.c.signal_logit_mean)
-                .where(calibration_samples.c.resolved == 1)
-                .order_by(calibration_samples.c.id.desc()).limit(max_rows)
-            ).all():
-                out.append({"raw": float(r[0]), "won": int(r[1] or 0), "regime": r[2],
-                            "opened_at": r[3], "source": "probe", "symbol": r[4], "signal_mean": r[5]})
-        return out
 
     def recent_trades(self, limit: int = 50) -> List[dict]:
         with self.engine.begin() as conn:

@@ -2,11 +2,9 @@
 Decision pipeline, run only when the entry signal fires:
 
     signal (EMA cross + tick + candle, checked by the caller)
-      -> barrier candidates              XML offsets (+ scaled widths [ADDED])
-      -> Monte Carlo                     P(exit inside barriers); every priced width is
-                                         kept as a 'probe' to learn from at expiry
       -> regime gate           [ADDED]  range contract needs a range-like market
-      -> calibration [ADDED]             logistic recalibration learned from trades + probes
+      -> barrier candidates              XML offsets (+ scaled widths [ADDED])
+      -> Monte Carlo + calibration [ADDED]  P(exit inside barriers)
       -> live Deriv proposal             never trade on theoretical payout
       -> edge / EV / uncertainty gate [ADDED]
       -> best accepted candidate (BARRIER_SELECTION: edge or ev) is returned for execution
@@ -18,16 +16,15 @@ barriers whenever Deriv quotes a payout above the stake.
 from __future__ import annotations
 
 import asyncio
-import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
 
 from app.deriv.client import DerivClient
 from app.features.stats import detect_regime, log_returns, realized_volatility
-from app.models.calibration import CalibrationTracker, _logit
+from app.models.calibration import CalibrationTracker
 from app.models.monte_carlo import MCResult, estimate_probability_in_range
 from app.strategy.barriers import BarrierChoice, candidate_barriers
 from app.strategy.filters import evaluate
@@ -42,8 +39,6 @@ class ScanOutcome:
     traded: bool
     trade_row: Optional[dict]
     rejections: List[dict]
-    # priced-but-not-bought candidates, to be resolved at expiry and learned from
-    probes: List[dict] = field(default_factory=list)
 
 
 def _rejection(symbol: str, duration: int, regime: str, reason: str, **extra) -> dict:
@@ -84,7 +79,6 @@ async def evaluate_signal(
     consecutive_losses: int = 0,
     stake_multiplier: float = 1.0,
     extra_edge_requirement: float = 0.0,
-    probe_only: bool = False,
 ) -> ScanOutcome:
     duration = cfg.duration_minutes
     if len(closes) < MIN_HISTORY_CANDLES:
@@ -97,8 +91,16 @@ async def evaluate_signal(
     regime = detect_regime(closes)
     regime_name = regime.regime.value
 
-    # ---- barrier candidates + Monte Carlo (priced before any gate, so even a
-    #      blocked or probe-only signal yields labelled outcomes to learn from)
+    # ---- regime gate -------------------------------------------------
+    if cfg.use_regime_gate and (regime_name not in cfg.range_regimes
+                                or regime.confidence < cfg.min_regime_confidence):
+        reason = (f"REGIME {regime_name}({regime.confidence:.2f}) NOT RANGE-FRIENDLY"
+                  if regime_name not in cfg.range_regimes else "REGIME CONFIDENCE TOO LOW")
+        logger.info(f"{symbol} | sig={direction} | regime={regime_name}({regime.confidence:.2f}) "
+                    f"vol={current_vol:.5f} -> {reason}")
+        return ScanOutcome(symbol, False, None, [_rejection(symbol, duration, regime_name, reason)])
+
+    # ---- barrier candidates ------------------------------------------
     choices = candidate_barriers(
         symbol, cfg.barrier_mode, cfg.fixed_barriers, cfg.barrier_vol_multiple,
         pool_sigma, current_price, duration, cfg.barrier_scales,
@@ -112,33 +114,10 @@ async def evaluate_signal(
         cfg.monte_carlo.default_paths,
     )
 
-    # Mean logit over every width priced for this signal: separates "how calm does
-    # the market look" (same for all widths) from "how wide is this barrier".
-    signal_mean = sum(_logit(mc.probability) for mc in mcs) / len(mcs)
-    opened_at = time.time()
-    probe_rows = [
-        {"symbol": symbol, "regime": regime_name, "raw_probability": mc.probability,
-         "signal_logit_mean": signal_mean,
-         "lower_barrier": current_price + ch.lower_offset, "upper_barrier": current_price + ch.upper_offset,
-         "opened_at": opened_at, "expires_at": opened_at + duration * 60}
-        for ch, mc in zip(choices, mcs)
-    ] if cfg.learn_from_rejected else []
-
-    # ---- regime gate -------------------------------------------------
-    if cfg.use_regime_gate and (regime_name not in cfg.range_regimes
-                                or regime.confidence < cfg.min_regime_confidence):
-        reason = (f"REGIME {regime_name}({regime.confidence:.2f}) NOT RANGE-FRIENDLY"
-                  if regime_name not in cfg.range_regimes else "REGIME CONFIDENCE TOO LOW")
-        logger.info(f"{symbol} | sig={direction} | regime={regime_name}({regime.confidence:.2f}) "
-                    f"vol={current_vol:.5f} -> {reason}")
-        return ScanOutcome(symbol, False, None, [_rejection(symbol, duration, regime_name, reason)], probe_rows)
-
-    if probe_only:
-        return ScanOutcome(symbol, False, None, [], probe_rows)
-
     stake = staking.stake_for(consecutive_losses=consecutive_losses)
     if stake_multiplier != 1.0:
         stake = max(round(stake * stake_multiplier, 2), cfg.staking.minimum_stake)
+    calibration_buckets = calibration.snapshot()
 
     # Edge gate off => only "payout must exceed stake" (and MIN_PAYOUT_MULTIPLIER) remain.
     if cfg.use_edge_gate:
@@ -153,30 +132,26 @@ async def evaluate_signal(
     rejections: List[dict] = []
     best_decision = None
     best_row = None
-    best_idx = None
 
     # Quote every width at once (the client rate-limits internally): one
     # round-trip of latency instead of N, and the proposals are all equally
     # fresh when the winner is bought.
-    valid = [(i, ch, mc) for i, (ch, mc) in enumerate(zip(choices, mcs))
+    valid = [(ch, mc) for ch, mc in zip(choices, mcs)
              if ch.upper_offset > ch.lower_offset and ch.lower_offset < 0 < ch.upper_offset]
     quotes = await asyncio.gather(*[
         client.request_proposal(symbol=symbol, duration_minutes=duration, stake=stake,
                                 lower_barrier=ch.lower_offset, upper_barrier=ch.upper_offset)
-        for _, ch, _mc in valid
+        for ch, _ in valid
     ], return_exceptions=True)
 
     def _score(d) -> float:
         return d.edge if cfg.barrier_selection == "edge" else d.expected_value
 
-    for (idx, ch, mc), proposal in zip(valid, quotes):
-        calibrated = calibration.calibrate(mc.probability, regime=regime_name, signal_mean=signal_mean)
+    for (ch, mc), proposal in zip(valid, quotes):
+        calibrated = calibration.calibrate(mc.probability, buckets=calibration_buckets)
         lower_offset, upper_offset = ch.lower_offset, ch.upper_offset
         if isinstance(proposal, Exception):
-            if "no return" in str(proposal).lower():
-                logger.info(f"{symbol}: x{ch.scale:g} barriers too wide -- Deriv offers no return, skipped")
-            else:
-                logger.warning(f"{symbol}: proposal failed for x{ch.scale:g} ({proposal!r}) -- skipping candidate")
+            logger.warning(f"{symbol}: proposal failed for x{ch.scale:g} ({proposal!r}) -- skipping candidate")
             continue
 
         payout = float(proposal.get("payout", 0.0) or 0.0)
@@ -205,11 +180,6 @@ async def evaluate_signal(
             duration_minutes=duration, edge_duration_scaling=0.0,
         )
 
-        accept, reason = decision.accept, decision.reason
-        if accept and calibrated < cfg.min_win_probability:
-            accept = False
-            reason = f"WIN PROBABILITY {calibrated:.2f} BELOW {cfg.min_win_probability:.2f}"
-
         row = {
             "trade_id": str(uuid.uuid4()), "symbol": symbol, "entry_price": entry_spot,
             "duration_minutes": duration,
@@ -222,7 +192,6 @@ async def evaluate_signal(
             "regime": regime_name, "regime_confidence": regime.confidence,
             "volatility": current_vol, "model_disagreement": mc.model_disagreement,
             "mc_path_count": mc.path_count, "decision_score": decision.expected_value,
-            "signal_logit_mean": signal_mean,
             "model_version": MODEL_VERSION,
         }
 
@@ -231,18 +200,15 @@ async def evaluate_signal(
             f"({ch.source} x{ch.scale:g}) | regime={regime_name}({regime.confidence:.2f}) | vol={current_vol:.5f} | "
             f"raw_p={mc.probability:.3f} cal_p={calibrated:.3f} implied_p={decision.implied_probability:.3f} "
             f"edge={decision.edge:+.3f} payout_x={decision.payout_multiplier:.3f} ev={decision.expected_value:+.4f} "
-            f"stake={stake:.2f} -> {'ACCEPTED' if accept else reason}"
+            f"stake={stake:.2f} -> {decision.reason}"
         )
 
-        if accept:
+        if decision.accept:
             if best_decision is None or _score(decision) > _score(best_decision):
-                best_decision, best_row, best_idx = decision, row, idx
+                best_decision, best_row = decision, row
         else:
-            rejections.append({**row, "rejection_reason": reason})
+            rejections.append({**row, "rejection_reason": decision.reason})
 
-    # the bought candidate is learned from through its own settled trade --
-    # recording it as a probe too would count the same outcome twice
-    probes = [p for i, p in enumerate(probe_rows) if i != best_idx]
     if best_decision is not None and best_row is not None:
-        return ScanOutcome(symbol, True, best_row, rejections, probes)
-    return ScanOutcome(symbol, False, None, rejections, probes)
+        return ScanOutcome(symbol, True, best_row, rejections)
+    return ScanOutcome(symbol, False, None, rejections)

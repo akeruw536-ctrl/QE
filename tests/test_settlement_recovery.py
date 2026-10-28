@@ -25,7 +25,6 @@ def test_reconnect_delivers_an_already_sold_snapshot_to_the_contract_callback():
 
     c._open_socket = noop
     c._recv_pump = noop
-    c._verify_alive = noop
     c.send = fake_send
     c._subscriptions["contract:9"] = Subscription(
         request={"proposal_open_contract": 1, "contract_id": 9, "subscribe": 1},
