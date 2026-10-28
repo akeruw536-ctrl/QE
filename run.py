@@ -29,7 +29,7 @@ import numpy as np
 from app.config import load_config
 from app.data.storage import Storage
 from app.deriv.client import BuyAmbiguousError, DerivClient
-from app.models.calibration import AdaptiveCalibrator
+from app.models.calibration import CalibrationTracker
 from app.monitoring.logging_utils import setup_logging
 from app.state_machine import State, StateMachine
 from app.strategy.engine import evaluate_signal
@@ -43,9 +43,6 @@ SHADOW_RESOLVE_INTERVAL_SECONDS = 10
 SHADOW_RESOLVE_GRACE_SECONDS = 3      # let the expiry tick land before asking for it
 STATS_LOG_INTERVAL_SECONDS = 15 * 60
 LIVE_WATCHDOG_INTERVAL_SECONDS = 20
-DATA_RECOVERY_INTERVAL_SECONDS = 20
-TICK_SILENCE_RECONNECT_SECONDS = 90    # no tick on any symbol for this long -> force a reconnect
-FORCED_RECONNECT_COOLDOWN_SECONDS = 120
 LIVE_WATCHDOG_GRACE_SECONDS = 20     # let the stream settle it first
 HEALTH_STALE_AFTER_SECONDS = 120
 
@@ -56,20 +53,13 @@ class Bot:
         self.logger = setup_logging(self.cfg.log_level)
         self.sm = StateMachine(self.logger)
         self.storage = Storage(self.cfg.database_url, self.cfg.sqlite_path, self.logger, schema=self.cfg.db_schema)
-        self.calibration = AdaptiveCalibrator(
-            self.storage, probe_weight=self.cfg.probe_weight,
-            halflife_hours=self.cfg.calibration_halflife_hours,
-            prior_strength=self.cfg.calibration_prior_strength,
-            regime_prior_strength=self.cfg.calibration_regime_prior_strength)
+        self.calibration = CalibrationTracker(self.storage)
         self.staking = build_staking_engine(self.cfg.staking)
         self.client: DerivClient | None = None
         self.closes_by_symbol: dict[str, deque] = {}
         self.candles_by_symbol: dict[str, list] = {}
         self.detectors: dict[str, TickSignalDetector] = {}
         self._evaluating: set[str] = set()
-        self._probe_only: dict[str, bool] = {}
-        self._tick_subscribed: set[str] = set()
-        self._last_tick_at: dict[str, float] = {}
         self._session_cache: tuple | None = None   # (fetched_at, pnl)
         self._session_state_logged = "OK"
         # trade_id -> symbol for every position occupying a slot. Shadow
@@ -116,9 +106,6 @@ class Bot:
         retired = self.storage.retire_legacy_shadow_rows()
         if retired:
             self.logger.info(f"Marked {retired} pre-upgrade shadow rows as UNRESOLVED (no expiry recorded, cannot be settled)")
-        cal = self.calibration.refit()
-        self.logger.info(f"CALIBRATION loaded: {cal['n_trades']} trades + {cal['n_probes']} probes -> "
-                         f"a={cal['a']} b={cal['b']} offsets={cal['regime_offsets']}")
         self.sm.transition(State.SYNCING_DATA)
 
         self.sm.transition(State.CONNECTING)
@@ -138,8 +125,6 @@ class Bot:
 
         self._spawn(self._shadow_resolver_loop(), "shadow-resolver")
         self._spawn(self._live_settlement_watchdog(), "live-settlement-watchdog")
-        self._spawn(self._probe_resolver_loop(), "probe-resolver")
-        self._spawn(self._data_recovery_loop(), "data-recovery")
         self._spawn(self._stats_loop(), "stats-logger")
 
         self.sm.transition(State.READY)
@@ -152,60 +137,19 @@ class Bot:
 
     async def _prime_ticks(self):
         """Seed each symbol's EMA state from tick history, then subscribe. A
-        cross is detected on the exact tick it happens, like the XML. Failures
-        here must never kill the process (a dead data feed used to crash-loop
-        the container until Railway gave up): the recovery loop retries."""
+        cross is detected on the exact tick it happens, like the XML."""
         for symbol in self.cfg.symbols:
-            self.detectors.setdefault(
-                symbol, TickSignalDetector(self.cfg.ema_fast, self.cfg.ema_slow, self.cfg.require_tick_confirmation))
-            await self._subscribe_ticks_safe(symbol)
-
-    async def _subscribe_ticks_safe(self, symbol: str) -> bool:
-        det = self.detectors[symbol]
-        if not det.ready:
+            det = TickSignalDetector(self.cfg.ema_fast, self.cfg.ema_slow, self.cfg.require_tick_confirmation)
             try:
                 history = await self.client.get_tick_history(symbol, self.cfg.tick_buffer)
-                if history:
-                    det.seed(history)
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning(f"{symbol}: tick history failed ({exc!r}) -- will warm up from live ticks")
-        try:
+                history = []
+            if history:
+                det.seed(history)
+            self.detectors[symbol] = det
             await self.client.subscribe_ticks(symbol, lambda msg, s=symbol: self._on_tick(s, msg))
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning(f"{symbol}: tick subscription failed ({exc!r}) -- will keep retrying")
-            return False
-        self._tick_subscribed.add(symbol)
-        self._last_tick_at.setdefault(symbol, time.time())
-        self.logger.info(f"{symbol}: tick stream subscribed (EMA state "
-                         f"{'ready' if det.ready else 'warming up from live ticks'})")
-        return True
-
-    async def _data_recovery_loop(self):
-        """Keeps the data feed alive without a restart: retries a failed tick
-        subscription or empty candle history, and if NO symbol has produced a
-        tick for TICK_SILENCE_RECONNECT_SECONDS (a connected-but-silent socket)
-        forces a fresh connection."""
-        last_forced = 0.0
-        while not self._stop.is_set():
-            try:
-                for symbol in self.cfg.symbols:
-                    if symbol not in self._tick_subscribed:
-                        await self._subscribe_ticks_safe(symbol)
-                    if not self.candles_by_symbol.get(symbol):
-                        await self._refresh_candles(symbol)
-                if self._tick_subscribed:
-                    now = time.time()
-                    newest = max(self._last_tick_at.get(s, 0.0) for s in self._tick_subscribed)
-                    if (now - newest > TICK_SILENCE_RECONNECT_SECONDS
-                            and now - last_forced > FORCED_RECONNECT_COOLDOWN_SECONDS):
-                        last_forced = now
-                        await self.client.force_reconnect(f"no ticks for {int(now - newest)}s")
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning(f"data recovery pass failed (non-fatal): {exc!r}")
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=DATA_RECOVERY_INTERVAL_SECONDS)
-            except asyncio.TimeoutError:
-                pass
+            self.logger.info(f"{symbol}: tick stream subscribed (EMA state {'seeded from %d ticks' % len(history) if det.ready else 'warming up'})")
 
     async def _refresh_candles(self, symbol: str) -> None:
         """Fresh fetch of candle history (OHLC). Deliberately NOT built on the
@@ -249,11 +193,6 @@ class Bot:
         """Housekeeping only: signals are tick-driven (see _on_tick)."""
         while not self._stop.is_set():
             self.sm.reassess_cautions()
-            if self.calibration.needs_refit():
-                try:
-                    await asyncio.to_thread(self.calibration.refit)
-                except Exception as exc:  # noqa: BLE001
-                    self.logger.warning(f"calibration refit failed (non-fatal): {exc!r}")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.cfg.scan_interval_seconds)
             except asyncio.TimeoutError:
@@ -266,7 +205,6 @@ class Bot:
         det = self.detectors.get(symbol)
         if quote is None or det is None or self._stop.is_set():
             return
-        self._last_tick_at[symbol] = time.time()
         try:
             direction = det.feed(float(quote))
         except (TypeError, ValueError):
@@ -275,9 +213,8 @@ class Bot:
             return
         if symbol in self._evaluating:
             return
-        if (not self.cfg.learn_from_rejected
-                and (self._open_count(symbol) >= self.cfg.max_concurrent_per_symbol
-                     or self._open_count() >= self.cfg.max_concurrent_contracts)):
+        if (self._open_count(symbol) >= self.cfg.max_concurrent_per_symbol
+                or self._open_count() >= self.cfg.max_concurrent_contracts):
             return  # a contract is running; the XML also waits for its result
         self._spawn(self._handle_signal(symbol, direction), f"signal-{symbol}")
 
@@ -308,8 +245,7 @@ class Bot:
             await self._process_signal(symbol, direction)
         except Exception as exc:  # noqa: BLE001
             self.logger.error(f"{symbol}: signal handling failed (non-fatal): {exc!r}")
-            if not self._probe_only.get(symbol):
-                self.sm.enter_caution(symbol, f"signal error: {exc!r}", self.cfg.caution_cooldown_seconds)
+            self.sm.enter_caution(symbol, f"signal error: {exc!r}", self.cfg.caution_cooldown_seconds)
         finally:
             self._evaluating.discard(symbol)
             if self._open_count() == 0 and self.sm.state not in (State.READY, State.CAUTION):
@@ -318,24 +254,17 @@ class Bot:
     async def _process_signal(self, symbol: str, direction: str) -> None:
         if self.sm.is_symbol_cautioned(symbol):
             return  # cooling down after an error; clears automatically
-        # A busy slot or a tripped session limit no longer discards the signal:
-        # it is still priced and its outcome learned from, it just cannot trade.
-        probe_only, why = False, ""
-        if (self._open_count(symbol) >= self.cfg.max_concurrent_per_symbol
-                or self._open_count() >= self.cfg.max_concurrent_contracts):
-            probe_only, why = True, "position open"
-        else:
-            status, pnl = self._session()
-            if status != "OK":
-                probe_only, why = True, f"session {status}"
-        if probe_only and not self.cfg.learn_from_rejected:
+        if self._open_count(symbol) >= self.cfg.max_concurrent_per_symbol:
             return
-        self._probe_only[symbol] = probe_only
+        if self._open_count() >= self.cfg.max_concurrent_contracts:
+            return
+        status, pnl = self._session()
+        if status != "OK":
+            return
 
         det = self.detectors[symbol]
         self.logger.info(f"{symbol} SIGNAL {direction}: EMA{self.cfg.ema_fast}={det.ema_fast:.4f} "
-                         f"EMA{self.cfg.ema_slow}={det.ema_slow:.4f} price={det.last_price}"
-                         + (f" [learning only: {why}]" if probe_only else ""))
+                         f"EMA{self.cfg.ema_slow}={det.ema_slow:.4f} price={det.last_price}")
 
         # fresh candles: the colour check needs the just-finished candle's final OHLC
         await self._refresh_candles(symbol)
@@ -357,8 +286,7 @@ class Bot:
         # one bot, one ladder: the XML has a single global Loss Count
         consecutive_losses = self.storage.consecutive_losses(None, shadow=shadow)
 
-        if not probe_only:
-            self.sm.transition(State.SIMULATING, symbol)
+        self.sm.transition(State.SIMULATING, symbol)
         try:
             outcome = await evaluate_signal(
                 symbol=symbol, direction=direction, closes=closes, current_price=current_price,
@@ -366,21 +294,11 @@ class Bot:
                 logger=self.logger, consecutive_losses=consecutive_losses,
                 stake_multiplier=self.sm.stake_multiplier(),
                 extra_edge_requirement=self.sm.extra_edge_requirement(),
-                probe_only=probe_only,
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.error(f"{symbol}: decision cycle failed (non-fatal): {exc!r}")
-            if not probe_only:
-                self.sm.enter_caution(symbol, f"decision error: {exc!r}", self.cfg.caution_cooldown_seconds)
-                self.sm.transition(State.READY)
-            return
-
-        if outcome.probes:
-            try:
-                self.storage.record_probes(outcome.probes)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning(f"{symbol}: could not record probes (non-fatal): {exc!r}")
-        if probe_only:
+            self.sm.enter_caution(symbol, f"decision error: {exc!r}", self.cfg.caution_cooldown_seconds)
+            self.sm.transition(State.READY)
             return
 
         for rej in outcome.rejections:
@@ -589,45 +507,6 @@ class Bot:
             except asyncio.TimeoutError:
                 pass
 
-    async def _probe_resolver_loop(self):
-        """Settles priced-but-not-bought candidates against the real tick at
-        expiry (same rule as a contract: exit strictly inside the barriers).
-        All candidates of one signal share an expiry, so one tick lookup
-        settles the whole group. Fresh outcomes trigger a calibration refit."""
-        last_prune = 0.0
-        while not self._stop.is_set():
-            try:
-                now = time.time()
-                due = self.storage.open_probes(now - SHADOW_RESOLVE_GRACE_SECONDS)
-                groups: dict = {}
-                for pr in due:
-                    groups.setdefault((pr["symbol"], int(pr["expires_at"])), []).append(pr)
-                resolved = 0
-                for (symbol, expires_at), rows in groups.items():
-                    if now - expires_at > 1800:           # tick history no longer reachable; stop retrying
-                        for pr in rows:
-                            self.storage.abandon_probe(pr["id"])
-                        continue
-                    spot = await self.client.get_spot_at(symbol, expires_at)
-                    if spot is None:
-                        continue                          # retry next pass
-                    exit_price, _ = spot
-                    for pr in rows:
-                        won = float(pr["lower_barrier"]) < exit_price < float(pr["upper_barrier"])
-                        if self.storage.resolve_probe(pr["id"], won, exit_price):
-                            resolved += 1
-                if resolved:
-                    self.calibration.mark_dirty(resolved)
-                if now - last_prune > 3600:
-                    last_prune = now
-                    self.storage.prune_probes(now - self.cfg.probe_keep_days * 86400)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning(f"probe resolver pass failed (non-fatal): {exc!r}")
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=SHADOW_RESOLVE_INTERVAL_SECONDS)
-            except asyncio.TimeoutError:
-                pass
-
     # -------------------------------------------------------------- stats
     def stats(self) -> dict:
         shadow = self.cfg.shadow_mode
@@ -655,12 +534,6 @@ class Bot:
             "max_daily_exposure": self.cfg.max_daily_exposure,
             "shadow": self.storage.performance_summary(shadow=True),
             "executed": self.storage.performance_summary(shadow=False),
-            "ladder": {m: self.storage.ladder_stats(m == "shadow", self.cfg.staking.martingale_start,
-                                                    self.cfg.staking.martingale_level)
-                       for m in ("executed", "shadow")},
-            "calibration": {**self.calibration.summary(), "probes": self.storage.probe_counts()},
-            "breakdown": {"executed": self.storage.breakdown(shadow=False),
-                          "shadow": self.storage.breakdown(shadow=True)},
         }
 
     async def _stats_loop(self):
@@ -679,25 +552,9 @@ class Bot:
                             f"PERFORMANCE[{mode}] settled={p['settled']} win_rate={p['win_rate']} "
                             f"avg_predicted={p['avg_predicted']} avg_implied={p['avg_implied']} "
                             f"pnl={p['pnl']:+.2f} roi={p['roi']}"
-                            + self._ladder_suffix(s.get("ladder", {}).get(mode))
                         )
-                c = s.get("calibration") or {}
-                if c.get("n_trades", 0) + c.get("n_probes", 0):
-                    self.logger.info(
-                        f"CALIBRATION trades={c['n_trades']} probes={c['n_probes']} a={c['a']} b={c['b']} "
-                        f"actual={c.get('actual_win_rate')} raw={c.get('mean_raw')} calibrated={c.get('mean_calibrated')} "
-                        f"brier_raw={c.get('brier_raw')} brier_cal={c.get('brier_calibrated')} offsets={c['regime_offsets']}")
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning(f"stats logging failed (non-fatal): {exc!r}")
-
-    @staticmethod
-    def _ladder_suffix(ladder: dict | None) -> str:
-        """Appended to the PERFORMANCE line so one pasted line carries the risk picture."""
-        if not ladder:
-            return ""
-        ms = ladder.get("max_stake") or {}
-        return (f" max_stake={ms.get('stake')} max_level={ladder['max_martingale_level']} "
-                f"max_loss_streak={ladder['max_loss_streak']} max_drawdown={ladder['max_drawdown']}")
 
     def is_healthy(self) -> tuple[bool, str]:
         if self.client is None:

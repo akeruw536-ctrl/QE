@@ -135,13 +135,8 @@ class Config:
     # Widths are multiples of the base (XML / vol) width, so the search is
     # adaptive: every signal prices all of them live and keeps the best.
     barrier_scales: List[float] = field(
-        default_factory=lambda: _env_float_list("BARRIER_SCALES", [1.0, 1.15, 1.3, 1.5, 1.75, 2.0, 2.5])
+        default_factory=lambda: _env_float_list("BARRIER_SCALES", [0.6, 0.75, 0.9, 1.0, 1.15, 1.3, 1.5, 1.75, 2.0])
     )
-    # Minimum (calibrated) probability that the exit lands INSIDE the barriers.
-    # The XML's +/-41 points is ~1 sigma on 1HZ90V: price finishes inside only
-    # ~62-70% of the time. Candidates below this are rejected, which pushes the
-    # search to wider barriers (higher win rate, lower payout). 0 disables it.
-    min_win_probability: float = float(os.getenv("MIN_WIN_PROBABILITY", "0.80"))
     # What "best" means among the ACCEPTED candidates: "edge" (model probability
     # minus Deriv's implied probability) or "ev" (edge x payout, i.e. expected
     # profit per stake). They can disagree: a tight barrier has a big payout
@@ -164,20 +159,6 @@ class Config:
     min_ev: float = float(os.getenv("MIN_EV", "0.0"))
     max_probability_uncertainty: float = float(os.getenv("MAX_PROB_UNCERTAINTY", "0.06"))
     max_model_disagreement: float = float(os.getenv("MAX_MODEL_DISAGREEMENT", "0.05"))
-
-    # --- learning ---
-    # Resolve the barrier widths that were priced but NOT bought against the
-    # real expiry tick and learn from them too. Many more labelled outcomes
-    # per hour, and unbiased across barrier widths and regimes.
-    learn_from_rejected: bool = field(default_factory=lambda: _env_bool("LEARN_FROM_REJECTED", True))
-    # weight of a probe vs a real trade (the candidates of one signal share one terminal price)
-    probe_weight: float = float(os.getenv("PROBE_WEIGHT", "0.4"))
-    # recent outcomes count more: weight halves every N hours (0 = no decay)
-    calibration_halflife_hours: float = float(os.getenv("CALIBRATION_HALFLIFE_HOURS", "96"))
-    # how hard calibration is anchored to "no correction" (pseudo-observations, roughly)
-    calibration_prior_strength: float = float(os.getenv("CALIBRATION_PRIOR_STRENGTH", "3"))
-    calibration_regime_prior_strength: float = float(os.getenv("CALIBRATION_REGIME_PRIOR_STRENGTH", "10"))
-    probe_keep_days: int = int(os.getenv("PROBE_KEEP_DAYS", "14"))
 
     # --- session limits ---
     # [XML] Target Profit = 62, Stop Loss = 200. 0 disables either one.
@@ -230,8 +211,6 @@ class Config:
             problems.append("CANDLE_REFERENCE must be closed or forming.")
         if self.barrier_mode not in ("auto", "fixed", "vol"):
             problems.append("BARRIER_MODE must be auto, fixed or vol.")
-        if not 0.0 <= self.min_win_probability < 1.0:
-            problems.append("MIN_WIN_PROBABILITY must be between 0 and 1 (0 = off).")
         if self.barrier_selection not in ("edge", "ev"):
             problems.append("BARRIER_SELECTION must be edge or ev.")
         if not self.barrier_scales or any(s <= 0 for s in self.barrier_scales):

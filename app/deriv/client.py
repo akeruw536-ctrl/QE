@@ -92,8 +92,6 @@ AUTH_LEGACY = "legacy"
 
 
 KEEPALIVE_INTERVAL_SECONDS = 30.0   # Deriv closes a socket with no API request for ~2 min
-LIVENESS_ATTEMPTS = 3               # fresh handshakes tried when a new socket never answers
-LIVENESS_TIMEOUT_SECONDS = 8.0
 
 
 class DerivAPIError(Exception):
@@ -195,62 +193,10 @@ class DerivClient:
             await self._open_socket()
             # Rule 3: reader task exists before anything else can need it.
             self._pump_task = asyncio.create_task(self._recv_pump(), name="deriv-pump")
-            await self._verify_alive()
         # Rule 2: exactly one long-lived supervisor for the client's whole life.
         self._supervisor_task = asyncio.create_task(self._supervise_pump(), name="deriv-pump-supervisor")
         self._keepalive_task = asyncio.create_task(self._keepalive(), name="deriv-keepalive")
         self.logger.info(f"Deriv connected (auth_mode={self.auth_mode})")
-
-    async def _verify_alive(self) -> None:
-        """A socket can open (OTP accepted, handshake done) and then never answer
-        a single request -- seen in production: every candle and tick request
-        timed out after 'Deriv connected', then the bot crashed. Prove the new
-        socket responds with a ping before anyone relies on it; if it does not,
-        drop it and handshake again with a fresh OTP. Called with the connect
-        lock held and the pump running. Never raises: if every attempt fails it
-        logs and carries on, and the callers' own retry logic takes over."""
-        for attempt in range(1, LIVENESS_ATTEMPTS + 1):
-            try:
-                await self._send_raw({"ping": 1}, timeout=LIVENESS_TIMEOUT_SECONDS)
-                return
-            except DerivAPIError as exc:
-                if exc.code != "Disconnected":
-                    return                       # it answered (even with an error) -> alive
-            except asyncio.TimeoutError:
-                pass
-            self.logger.warning(
-                f"Deriv socket opened but is not answering (attempt {attempt}/{LIVENESS_ATTEMPTS})"
-                + (" -- re-handshaking with a fresh OTP" if attempt < LIVENESS_ATTEMPTS else ""))
-            if attempt == LIVENESS_ATTEMPTS:
-                break
-            await self._replace_socket()
-        self.logger.error("Deriv socket still unresponsive after fresh handshakes; continuing -- "
-                          "requests will retry and the bot's recovery loop keeps trying")
-
-    async def _replace_socket(self) -> None:
-        """Closes the current socket and opens a new one with its own pump.
-        The old pump is left to end on its own (cancelling it would be read by
-        the supervisor as a shutdown)."""
-        old_ws, old_pump = self._ws, self._pump_task
-        try:
-            if old_ws is not None:
-                await old_ws.close()
-        except Exception:  # noqa: BLE001
-            pass
-        if old_pump is not None and not old_pump.done():
-            await asyncio.wait({old_pump}, timeout=2.0)
-        await self._open_socket()
-        self._pump_task = asyncio.create_task(self._recv_pump(), name="deriv-pump")
-
-    async def force_reconnect(self, reason: str = "") -> None:
-        """Drops the socket; the supervisor sees the pump end and reconnects
-        (fresh OTP, liveness check, resubscribe everything)."""
-        self.logger.warning(f"Deriv: forcing a reconnect ({reason})")
-        try:
-            if self._ws is not None:
-                await self._ws.close()
-        except Exception:  # noqa: BLE001
-            pass
 
     async def _keepalive(self) -> None:
         """Deriv drops a socket that carries no API requests for ~2 minutes
@@ -512,7 +458,6 @@ class DerivClient:
             # before any resubscribe, because resubscribes await responses
             # only the reader can deliver.
             self._pump_task = asyncio.create_task(self._recv_pump(), name="deriv-pump")
-            await self._verify_alive()
             for key, sub in list(self._subscriptions.items()):
                 try:
                     resp = await self.send(sub.request)
